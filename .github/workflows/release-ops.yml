@@ -21,6 +21,10 @@ on:
         description: 'make a new commit on main before publishing'
         type: boolean
         default: false
+      target:
+        description: 'publish: target commit sha or branch (default main)'
+        required: false
+        default: 'main'
       cleanup_tag:
         description: 'delete op: also delete the tag'
         type: boolean
@@ -41,6 +45,7 @@ jobs:
       TAG: ${{ inputs.tag }}
       VER: ${{ inputs.version }}
       PRE: ${{ inputs.prerelease }}
+      TARGET: ${{ inputs.target }}
     steps:
       - name: Checkout (only when a new commit is requested)
         if: ${{ inputs.op == 'publish' && inputs.new_commit }}
@@ -75,8 +80,8 @@ jobs:
           done
           ls -l
           flag=""; [ "$PRE" = true ] && flag="--prerelease"
-          echo "== create draft"
-          gh release create "$TAG" --repo "$R" --draft $flag --target main --title "Synthetic $VER" --notes "Synthetic test release $VER (dummy files)"
+          echo "== create draft (target ${TARGET:-main})"
+          gh release create "$TAG" --repo "$R" --draft $flag --target "${TARGET:-main}" --title "Synthetic $VER" --notes "Synthetic test release $VER (dummy files)"
           echo "== upload"
           gh release upload "$TAG" --repo "$R" ./*
           echo "== draft state"
@@ -121,5 +126,6 @@ jobs:
           gh api "repos/$R/releases?per_page=100" --jq '.[]|[.tag_name,.draft,.prerelease,.immutable,.created_at,.published_at]|@tsv'
           echo "-- latest"; gh api "repos/$R/releases/latest" --jq .tag_name
           echo "-- tags"; gh api "repos/$R/tags?per_page=100" --jq '.[].name'
+          echo "-- commits"; gh api "repos/$R/commits?per_page=30" --jq '.[]|[.sha,.commit.committer.date,.commit.message]|@tsv'
           echo "-- immutable setting (needs admin, expected to be refused for the built-in token)"
           gh api "repos/$R/immutable-releases"; echo "rc=$?"
