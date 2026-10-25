@@ -47,12 +47,15 @@ const bytes = Buffer.from(JSON.stringify(statement));
 const signer = scenario === 'wrong-key' ? keyB : keyA;
 const envelope = JSON.stringify({ statement: bytes.toString('base64'), signature: crypto.sign(null, Buffer.concat([PREFIX, bytes]), signer.privateKey).toString('base64') });
 
-// commit the PUBLIC key (rotates per rehearsal draft)
+// commit the PUBLIC key (rotates per rehearsal draft; skipped by probe-list so the published v3.0.0 keeps a matching key on main)
+if (op !== 'probe-list') {
 const cur = ghJson(['api', `repos/${repo}/contents/keys/update-public-key.txt`]);
 gh(['api', '-X', 'PUT', `repos/${repo}/contents/keys/update-public-key.txt`, '--input', '-'],
   JSON.stringify({ message: `Rehearsal: public key for ${tag}`, content: Buffer.from(pubB64(keyA) + '\n').toString('base64'), sha: cur.sha }));
 fs.writeFileSync('keys/update-public-key.txt', pubB64(keyA) + '\n'); // local copy so verify in this job sees the new key
 out(`committed public key for ${tag} (private key discarded with this job)`);
+
+}
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reh-'));
 const files = { [name]: installer, [cfg.metadataName]: Buffer.from(yml) };
