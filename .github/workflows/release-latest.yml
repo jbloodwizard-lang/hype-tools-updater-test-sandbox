@@ -1,0 +1,32 @@
+name: release-latest
+
+# Disposable test workflow: change which published release GitHub treats as "latest".
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'release tag'
+        required: true
+      latest:
+        description: 'true | false'
+        required: true
+
+permissions: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      LATEST: ${{ inputs.latest }}
+    steps:
+      - name: Set latest flag
+        run: |
+          set +e
+          gh release edit "$TAG" --repo "$R" --latest="$LATEST"; echo "edit rc=$?"
+          echo "-- latest now:"; gh api "repos/$R/releases/latest" --jq .tag_name
+          gh api "repos/$R/releases/tags/$TAG" --jq '{tag_name,immutable,prerelease}'
