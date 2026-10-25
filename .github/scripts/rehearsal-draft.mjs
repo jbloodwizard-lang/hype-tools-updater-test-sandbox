@@ -76,6 +76,7 @@ else if (op === 'batch') {
   const rows = [];
   for (const [t, v, q, sc, frag] of plan) {
     make(t, v, q, sc);
+    out('drafts visible after make: ' + JSON.stringify(ghJson(['api', `repos/${repo}/releases?per_page=100`]).filter(x => x.draft).map(x => [x.tag_name, x.name, x.id])));
     const r = verifyLocally(t);
     const pass = frag === 'OK' ? r.ok : (!r.ok && r.line.includes(frag));
     rows.push({ tag: t, scenario: sc, expected: frag === 'OK' ? 'verify OK' : `fail closed [${frag}]`, got: r.line, pass });
