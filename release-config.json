@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "channel": "beta",
+  "appId": "com.hypetools.sandbox.beta",
+  "productName": "HYPE TOOLS SANDBOX (synthetic)",
+  "repo": "jbloodwizard-lang/hype-tools-updater-test-sandbox",
+  "tagPattern": "^v(\\d+\\.\\d+\\.\\d+)$",
+  "installerTemplate": "SandboxApp-{version}.AppImage",
+  "metadataName": "latest-linux.yml",
+  "statementName": "release-statement.json",
+  "publicKeyFile": "keys/update-public-key.txt",
+  "prerelease": false,
+  "retention": 2,
+  "approvalEnvironment": null
+}

@@ -1,0 +1,51 @@
+name: rehearsal
+
+# SANDBOX ONLY. Creates synthetic draft releases for the publishing rehearsal. Disposable keys, dummy payloads.
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: 'make | discard | add-asset'
+        required: true
+        type: string
+      tag:
+        description: 'tag, for example v3.0.0'
+        required: true
+        type: string
+      version:
+        description: 'version, for example 3.0.0'
+        required: false
+        type: string
+      sequence:
+        description: 'statement sequence'
+        required: false
+        type: string
+      scenario:
+        description: 'valid | extra-asset | bad-hash | wrong-channel | wrong-key | missing-statement | version-mismatch | prerelease-flag'
+        required: false
+        default: valid
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OP: ${{ inputs.op }}
+      TAG: ${{ inputs.tag }}
+      VER: ${{ inputs.version }}
+      SEQ: ${{ inputs.sequence }}
+      SCENARIO: ${{ inputs.scenario }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: node .github/scripts/rehearsal-draft.mjs "$OP" "$TAG" "$VER" "$SEQ" "$SCENARIO"

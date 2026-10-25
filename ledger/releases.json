@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "releases": [
+    { "tag": "v2.1.0", "version": "2.1.0", "sequence": 1, "status": "published", "note": "seeded from the earlier sandbox test" },
+    { "tag": "v2.2.0", "version": "2.2.0", "sequence": 2, "status": "published", "note": "seeded from the earlier sandbox test" }
+  ]
+}

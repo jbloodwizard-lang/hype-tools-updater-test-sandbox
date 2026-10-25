@@ -1,0 +1,60 @@
+name: verify-and-publish
+
+# Verifies a DRAFT release that the release manager prepared, then publishes it.
+# The draft is created and its assets uploaded outside this repository (by the release manager's own login).
+# This workflow never builds anything and never receives a signing key.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Draft release tag, for example v1.2.0'
+        required: true
+        type: string
+      dry_run:
+        description: 'Verify only; do not publish or delete anything'
+        required: true
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify draft (reads only; drafts are hidden from read-only tokens)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Self-test the release tool
+        run: node .github/scripts/lib.test.mjs
+      - name: Check the owner-approval gate is configured
+        run: node .github/scripts/release-tool.mjs gate-check --tag "$TAG"
+      - name: Verify draft
+        run: node .github/scripts/release-tool.mjs verify --tag "$TAG"
+
+  publish:
+    name: publish (approval required for LIVE)
+    needs: verify
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Publish, check, record in ledger, apply retention
+        run: node .github/scripts/release-tool.mjs publish --tag "$TAG"
