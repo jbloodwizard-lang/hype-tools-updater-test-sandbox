@@ -1,0 +1,125 @@
+name: release-ops
+
+# Disposable test workflow. Synthetic files only. Uses only the built-in per-run token.
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: 'publish | delete | mutate | probe'
+        required: true
+      tag:
+        description: 'release tag, for example v1.0.0'
+        required: false
+      version:
+        description: 'version string, for example 1.0.0'
+        required: false
+      prerelease:
+        description: 'mark as prerelease'
+        type: boolean
+        default: false
+      new_commit:
+        description: 'make a new commit on main before publishing'
+        type: boolean
+        default: false
+      cleanup_tag:
+        description: 'delete op: also delete the tag'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency: release-ops
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      VER: ${{ inputs.version }}
+      PRE: ${{ inputs.prerelease }}
+    steps:
+      - name: Checkout (only when a new commit is requested)
+        if: ${{ inputs.op == 'publish' && inputs.new_commit }}
+        uses: actions/checkout@v4.2.2
+        with:
+          ref: main
+
+      - name: New commit
+        if: ${{ inputs.op == 'publish' && inputs.new_commit }}
+        run: |
+          git config user.name "release-ops"
+          git config user.email "release-ops@users.noreply.github.com"
+          echo "$TAG $(date -u +%FT%TZ)" >> ledger.txt
+          git add ledger.txt
+          git commit -m "Test commit for $TAG"
+          git push origin HEAD:main
+
+      - name: Publish (draft, upload, verify, publish)
+        if: ${{ inputs.op == 'publish' }}
+        run: |
+          set -eu
+          mkdir out && cd out
+          for ext in exe AppImage; do
+            if [ "$ext" = exe ]; then n="SyntheticApp-Setup-$VER.exe"; else n="SyntheticApp-$VER.AppImage"; fi
+            head -c 262144 /dev/urandom > "$n"
+            sha=$(openssl dgst -sha512 -binary "$n" | base64 -w0)
+            size=$(stat -c %s "$n")
+            if [ "$ext" = exe ]; then y=latest.yml; else y=latest-linux.yml; fi
+            if [ "$PRE" = true ]; then y="beta${y#latest}"; fi
+            printf "version: %s\nfiles:\n  - url: %s\n    sha512: %s\n    size: %s\npath: %s\nsha512: %s\nreleaseDate: '%s'\n" \
+              "$VER" "$n" "$sha" "$size" "$n" "$sha" "$(date -u +%FT%T.000Z)" > "$y"
+          done
+          ls -l
+          flag=""; [ "$PRE" = true ] && flag="--prerelease"
+          echo "== create draft"
+          gh release create "$TAG" --repo "$R" --draft $flag --target main --title "Synthetic $VER" --notes "Synthetic test release $VER (dummy files)"
+          echo "== upload"
+          gh release upload "$TAG" --repo "$R" ./*
+          echo "== draft state"
+          gh api "repos/$R/releases" --jq ".[] | select(.tag_name==\"$TAG\") | {tag_name,draft,prerelease,immutable,assets:[.assets[].name]}"
+          echo "== publish"
+          gh release edit "$TAG" --repo "$R" --draft=false
+          echo "== published state"
+          gh api "repos/$R/releases/tags/$TAG" --jq '{tag_name,draft,prerelease,immutable,created_at,published_at,target_commitish,assets:[.assets[]|{name,size,digest}]}'
+
+      - name: Delete a whole release
+        if: ${{ inputs.op == 'delete' }}
+        run: |
+          set +e
+          c=""; [ "${{ inputs.cleanup_tag }}" = true ] && c="--cleanup-tag"
+          gh release delete "$TAG" --repo "$R" --yes $c; echo "delete rc=$?"
+          echo "-- tag ref after:"; gh api "repos/$R/git/ref/tags/$TAG" --jq .ref; echo "rc=$?"
+          echo "-- release after:"; gh api "repos/$R/releases/tags/$TAG" --jq .tag_name; echo "rc=$?"
+
+      - name: Mutation attempts on a published release
+        if: ${{ inputs.op == 'mutate' }}
+        run: |
+          set +e
+          echo "target: $TAG"
+          echo "-- A upload extra asset"; echo x > extra.txt; gh release upload "$TAG" --repo "$R" extra.txt; echo "rc=$?"
+          echo "-- B overwrite existing asset"; gh release upload "$TAG" --repo "$R" extra.txt --clobber; echo "rc=$?"
+          a=$(gh api "repos/$R/releases/tags/$TAG" --jq '.assets[0].id')
+          echo "-- C delete asset $a"; gh api -X DELETE "repos/$R/releases/assets/$a"; echo "rc=$?"
+          echo "-- D move tag to another commit"
+          other=$(gh api "repos/$R/commits?per_page=2" --jq '.[1].sha')
+          gh api -X PATCH "repos/$R/git/refs/tags/$TAG" -f sha="$other" -F force=true; echo "rc=$?"
+          echo "-- E delete tag ref"; gh api -X DELETE "repos/$R/git/refs/tags/$TAG"; echo "rc=$?"
+          echo "-- F edit release notes/title"; gh release edit "$TAG" --repo "$R" --notes "edited"; echo "rc=$?"
+          echo "-- G flip prerelease flag"; gh release edit "$TAG" --repo "$R" --prerelease=true; echo "rc=$?"
+          echo "-- H release state afterwards"
+          gh api "repos/$R/releases/tags/$TAG" --jq '{tag_name,draft,prerelease,immutable,assets:[.assets[].name]}'
+          gh api "repos/$R/git/ref/tags/$TAG" --jq '.object.sha'
+
+      - name: Probe
+        if: ${{ inputs.op == 'probe' }}
+        run: |
+          set +e
+          gh api "repos/$R/releases?per_page=100" --jq '.[]|[.tag_name,.draft,.prerelease,.immutable,.created_at,.published_at]|@tsv'
+          echo "-- latest"; gh api "repos/$R/releases/latest" --jq .tag_name
+          echo "-- tags"; gh api "repos/$R/tags?per_page=100" --jq '.[].name'
+          echo "-- immutable setting (needs admin, expected to be refused for the built-in token)"
+          gh api "repos/$R/immutable-releases"; echo "rc=$?"
