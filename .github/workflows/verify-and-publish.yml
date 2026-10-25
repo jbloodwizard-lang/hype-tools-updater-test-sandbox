@@ -36,7 +36,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Self-test the release tool
-        run: node .github/scripts/lib.test.mjs
+        run: |
+          node .github/scripts/lib.test.mjs
+          node .github/scripts/postpublish.test.mjs
+          node .github/scripts/publicio.test.mjs
       - name: Check the owner-approval gate is configured
         run: node .github/scripts/release-tool.mjs gate-check --tag "$TAG"
       - name: Verify draft

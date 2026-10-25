@@ -9,8 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ReleaseError, fail, validateConfig, versionFromTag, checkAssetAllowlist, parseUpdateYml, checkMetadata,
-  verifyStatement, validateLedger, lastPublished, planRetention, semverCmp,
+  verifyStatement, validateLedger, lastPublished, planRetention, semverCmp, previousGood, unresolvedPublications, lookupRelease,
 } from './lib.mjs';
+import { completePublication } from './postpublish.mjs';
+import { publicDownload, atomFirstTag } from './publicio.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
 const readJson = f => JSON.parse(fs.readFileSync(path.join(ROOT, f), 'utf8'));
@@ -46,6 +48,18 @@ function downloadAsset(repo, id, dest) {
   });
 }
 
+const realIo = repo => ({
+  getRelease: async tag => ghJson(['api', `repos/${repo}/releases/tags/${tag}`]),
+  getLatest: async () => ghJson(['api', `repos/${repo}/releases/latest`]),
+  download: publicDownload,
+  atomFirstTag: async () => {
+    const res = await fetch(`https://github.com/${repo}/releases.atom`);
+    if (!res.ok) throw new ReleaseError('atom-read', `HTTP ${res.status}`);
+    return atomFirstTag(await res.text());
+  },
+  setLatest: async tag => { gh(['release', 'edit', tag, '--repo', repo, '--latest']); },
+});
+
 function context() {
   const config = validateConfig(readJson('release-config.json'));
   const repo = process.env.GITHUB_REPOSITORY;
@@ -59,13 +73,13 @@ function context() {
 async function verifyDraft(ctx) {
   const { config, repo, tag, version, ledger } = ctx;
   const releases = listReleases(repo);
-  const matches = releases.filter(r => r.tag_name === tag);
-  if (matches.length !== 1) fail('release-lookup', `expected exactly one release for ${tag}, found ${matches.length}`);
-  const rel = matches[0];
+  const rel = lookupRelease(releases, tag, version, () => listReleases(repo));
   if (!rel.draft) fail('not-draft', `${tag} is already published; only drafts can be verified for publication`);
   if (rel.prerelease !== config.prerelease) fail('prerelease-flag', `prerelease must be ${config.prerelease}`);
   const def = ghJson(['api', `repos/${repo}`]).default_branch;
   if (rel.target_commitish !== def) fail('bad-target', `release target must be ${def}, got ${rel.target_commitish}`);
+  const pending = unresolvedPublications(ledger);
+  if (pending.length) fail('unresolved-publication', `${pending.join(', ')} was made public but its verification never finished; resolve it before publishing another release`);
   if (ledger.releases.some(r => r.tag === tag)) fail('tag-reused', `${tag} is already in the ledger; tag names are never reused`);
   const exp = checkAssetAllowlist(config, version, rel.assets);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hype-release-'));
@@ -87,7 +101,8 @@ async function verifyDraft(ctx) {
   fs.rmSync(dir, { recursive: true, force: true });
   const snapshot = rel.assets.map(a => ({ id: a.id, name: a.name, size: a.size, updated_at: a.updated_at })).sort((x, y) => x.id - y.id);
   note(`verified draft ${tag}: ${rel.assets.length} allowlisted assets, installer ${facts[exp.installer].size} bytes, statement sequence ${stmt.sequence}`);
-  return { release: rel, snapshot, statement: stmt, installerSha512: facts[exp.installer].sha512, exp };
+  const expected = { assets: Object.fromEntries(Object.entries(facts).map(([n, f]) => [n, { size: f.size, sha256: f.sha256 }])), installer: { size: facts[exp.installer].size, sha512: facts[exp.installer].sha512 } };
+  return { release: rel, snapshot, statement: stmt, installerSha512: facts[exp.installer].sha512, exp, expected, lastSequence: last.sequence, publicKey };
 }
 
 function gateCheck(ctx) {
@@ -113,6 +128,18 @@ function putLedger(repo, mutate) {
   }
 }
 
+// Record a release in the ledger (insert or update by tag). Never throws: a failed write is returned so the caller can
+// report it instead of leaving the workflow in an inconsistent state without saying so.
+function recordLedger(repo, tag, fields) {
+  try {
+    putLedger(repo, l => {
+      const cur = l.releases.find(r => r.tag === tag);
+      if (cur) Object.assign(cur, fields); else l.releases.push({ tag, ...fields });
+    });
+    return null;
+  } catch (e) { return `ledger write for ${tag} failed: ${String(e.stderr || e.message).slice(0, 160)}`; }
+}
+
 async function publish(ctx) {
   const { config, repo, tag, version } = ctx;
   gateCheck(ctx);
@@ -121,31 +148,19 @@ async function publish(ctx) {
   const again = listReleases(repo).find(r => r.tag_name === tag);
   const snap2 = again.assets.map(a => ({ id: a.id, name: a.name, size: a.size, updated_at: a.updated_at })).sort((x, y) => x.id - y.id);
   if (JSON.stringify(snap2) !== JSON.stringify(v.snapshot)) fail('draft-changed', 'draft assets changed after verification; aborting');
+  // Decided before anything becomes public: what to restore if the new release turns out to be bad.
+  const io = realIo(repo);
+  const previous = previousGood(ctx.ledger, listReleases(repo));
+  let latestBefore = null;
+  try { latestBefore = (await io.getLatest()).tag_name; } catch { /* no latest yet */ }
   gh(['release', 'edit', tag, '--repo', repo, '--draft=false', '--latest']);
-  note(`published ${tag}`);
-  const pub = ghJson(['api', `repos/${repo}/releases/tags/${tag}`]);
-  const problems = [];
-  if (pub.draft) problems.push('still a draft');
-  if (pub.prerelease !== config.prerelease) problems.push('prerelease flag changed');
-  const immutable = pub.immutable === true;
-  if (!immutable) problems.push('release is NOT immutable: enable Immutable releases in repository settings');
-  const latest = ghJson(['api', `repos/${repo}/releases/latest`]);
-  if (latest.tag_name !== tag) problems.push(`/releases/latest is ${latest.tag_name}, expected ${tag}`);
-  const pubSnap = pub.assets.map(a => ({ id: a.id, name: a.name, size: a.size })).sort((x, y) => x.id - y.id);
-  if (JSON.stringify(pubSnap) !== JSON.stringify(v.snapshot.map(({ id, name, size }) => ({ id, name, size })))) problems.push('asset set changed during publish');
-  for (const n of [v.exp.metadata, v.exp.statement]) {
-    const res = await fetch(`https://github.com/${repo}/releases/download/${tag}/${n}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const a = pub.assets.find(x => x.name === n);
-    if (!res.ok || (a.digest && a.digest !== `sha256:${crypto.createHash('sha256').update(buf).digest('hex')}`)) problems.push(`public download of ${n} does not match`);
-  }
-  const atom = await (await fetch(`https://github.com/${repo}/releases.atom`)).text();
-  const first = /<entry>[\s\S]*?releases\/tag\/([^"]+)"/.exec(atom);
-  if (!first || decodeURIComponent(first[1]) !== tag) problems.push(`releases.atom first entry is ${first && first[1]}`);
-  putLedger(repo, l => l.releases.push({ tag, version, sequence: v.statement.sequence, status: immutable ? 'published' : 'not-immutable', publishedAt: pub.published_at, installerSha512: v.installerSha512 }));
+  note(`published ${tag} (previous known-good: ${previous ? previous.tag : 'none'}; latest before: ${latestBefore || 'none'})`);
+  // From here the release is public. It is recorded as unverified until every check has passed.
+  const out = await completePublication({ io, config, repo, tag, version, v, previous, latestBefore, record: fields => recordLedger(repo, tag, fields) });
+  for (const l of out.lines) note(l);
+  if (!out.healthy) fail('post-publish-check', `${out.problems.length} problem(s); recovery: ${out.recovery ? out.recovery.outcome : 'not needed'}`);
   note(`ledger updated for ${tag}`);
-  if (problems.length) { for (const p of problems) note(`PROBLEM: ${p}`); fail('post-publish-check', problems.join('; ')); }
-  note('post-publish checks passed (draft cleared, immutable, latest, assets, public downloads, atom feed)');
+  note('post-publish checks passed (draft cleared, immutable, latest, all three assets downloaded and matched on size and sha256, installer sha512 matched metadata and signed statement, atom feed)');
   await retention(ctx);
 }
 
@@ -153,7 +168,7 @@ async function retention(ctx) {
   const { config, repo } = ctx;
   const ledger = validateLedger(JSON.parse(Buffer.from(ghJson(['api', `repos/${repo}/contents/ledger/releases.json`]).content, 'base64').toString('utf8')));
   const plan = planRetention({ ledger, liveReleases: listReleases(repo), keep: config.retention });
-  note(`retention plan: keep ${JSON.stringify(plan.keep)}, delete ${JSON.stringify(plan.delete)}, unowned (never touched) ${JSON.stringify(plan.unowned)}, owned but not immutable ${JSON.stringify(plan.notImmutableOwned)}`);
+  note(`retention plan: keep ${JSON.stringify(plan.keep)}, delete ${JSON.stringify(plan.delete)}, unowned (never touched) ${JSON.stringify(plan.unowned)}, owned but not immutable ${JSON.stringify(plan.notImmutableOwned)}, owned but unhealthy (never touched) ${JSON.stringify(plan.unhealthyOwned)}`);
   if (DRY) return;
   for (const tag of plan.delete) {
     gh(['release', 'delete', tag, '--repo', repo, '--yes']);

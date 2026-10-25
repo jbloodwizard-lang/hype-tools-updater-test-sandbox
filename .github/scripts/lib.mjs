@@ -39,6 +39,18 @@ export function versionFromTag(config, tag) {
   return m[1];
 }
 
+// Exactly one release must carry the tag. A miss or a duplicate always fails; `relist` (optional) is called once on a miss
+// purely to put evidence into the error message (a later read that sees the draft does NOT turn the failure into a pass).
+export function lookupRelease(releases, tag, version, relist) {
+  const matches = releases.filter(r => r.tag_name === tag);
+  if (matches.length === 1) return matches[0];
+  const drafts = releases.filter(r => r.draft).map(r => `${r.tag_name}|${r.name}`);
+  const near = releases.filter(r => r.tag_name !== tag && (String(r.tag_name).includes(version) || String(r.name).includes(version))).map(r => `${r.tag_name}|${r.name}|${r.draft ? 'draft' : 'published'}`);
+  let again = '';
+  if (matches.length === 0 && relist) { try { again = `; a second listing found ${relist().filter(r => r.tag_name === tag).length}`; } catch (e) { again = `; second listing failed (${String(e.message).slice(0, 60)})`; } }
+  fail('release-lookup', `expected exactly one release for ${tag}, found ${matches.length} (listing returned ${releases.length} releases, ${drafts.length} drafts: ${JSON.stringify(drafts.slice(0, 20))}; similar: ${JSON.stringify(near.slice(0, 10))}${again})`);
+}
+
 export function expectedAssets(config, version) {
   return { installer: config.installerTemplate.replaceAll('{version}', version), metadata: config.metadataName, statement: config.statementName };
 }
@@ -130,11 +142,16 @@ export function verifyStatement(envelopeText, publicKeyB64, config, version, exp
   return s;
 }
 
+// published = verified healthy; pending-verification = made public, checks not finished (an unknown state that blocks the
+// next publication until the owner resolves it); failed-verification = made public but a post-publication check failed
+// (never counted as healthy, never deleted automatically); retired = removed by retention; not-immutable = legacy value.
+export const LEDGER_STATUSES = ['published', 'retired', 'not-immutable', 'pending-verification', 'failed-verification'];
+
 export function validateLedger(l) {
   if (!l || l.schema !== 1 || !Array.isArray(l.releases)) fail('bad-ledger', 'shape');
   const tags = new Set();
   for (const r of l.releases) {
-    if (typeof r.tag !== 'string' || !SEMVER.test(r.version) || !Number.isSafeInteger(r.sequence) || !['published', 'retired', 'not-immutable'].includes(r.status)) fail('bad-ledger', `entry ${JSON.stringify(r.tag)}`);
+    if (typeof r.tag !== 'string' || !SEMVER.test(r.version) || !Number.isSafeInteger(r.sequence) || !LEDGER_STATUSES.includes(r.status)) fail('bad-ledger', `entry ${JSON.stringify(r.tag)}`);
     if (tags.has(r.tag)) fail('bad-ledger', `duplicate ${r.tag}`);
     tags.add(r.tag);
   }
@@ -145,6 +162,18 @@ export function lastPublished(ledger) {
   let seq = 0, ver = '0.0.0';
   for (const r of ledger.releases) { if (r.sequence > seq) seq = r.sequence; if (semverCmp(r.version, ver) > 0) ver = r.version; }
   return { sequence: seq, version: ver };
+}
+
+// The newest owned release that is verified healthy, live and immutable: the target to restore if a newer one fails.
+export function previousGood(ledger, liveReleases) {
+  const live = new Map(liveReleases.filter(r => !r.draft).map(r => [r.tag_name, r]));
+  const good = ledger.releases.filter(r => r.status === 'published' && live.has(r.tag) && live.get(r.tag).immutable === true && live.get(r.tag).prerelease === false)
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  return good ? { tag: good.tag, version: good.version, sequence: good.sequence } : null;
+}
+
+export function unresolvedPublications(ledger) {
+  return ledger.releases.filter(r => r.status === 'pending-verification').map(r => r.tag);
 }
 
 // Ownership-aware retention: only releases recorded in the ledger as published may be removed,
@@ -160,5 +189,6 @@ export function planRetention({ ledger, liveReleases, keep }) {
     if (newerHealthy >= keep) del.push(r.tag);
   }
   const unowned = [...live.keys()].filter(t => !ledger.releases.some(r => r.tag === t));
-  return { keep: [...keepSet], delete: del, unowned, notImmutableOwned: owned.filter(r => live.get(r.tag).immutable !== true).map(r => r.tag) };
+  const unhealthyOwned = ledger.releases.filter(r => ['pending-verification', 'failed-verification'].includes(r.status) && live.has(r.tag)).map(r => r.tag);
+  return { keep: [...keepSet], delete: del, unowned, unhealthyOwned, notImmutableOwned: owned.filter(r => live.get(r.tag).immutable !== true).map(r => r.tag) };
 }

@@ -68,6 +68,16 @@ gh(['release', 'upload', tag, '--repo', repo, ...Object.keys(files).map(n => pat
 out(`draft ${tag} created: scenario=${scenario} sequence=${sequenceArg} assets=${Object.keys(files).join(', ')} installer=${installer.length} bytes sha512=${sha.slice(0, 16)}...`);
 }
 
+// The releases list can miss a draft for a moment right after it is created (see probe-list). This test harness only waits
+// until its own draft shows up before verifying; the release tool itself never retries.
+function waitVisible(t) {
+  for (let i = 0; i < 20; i++) {
+    if (findDraftFor(t).length === 1) { if (i) out(`draft ${t} became visible in the release list after ${i} extra read(s)`); return; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  }
+  throw new Error(`draft ${t} never became visible in the release list`);
+}
+
 function verifyLocally(t) {
   try { const o = execFileSync('node', ['.github/scripts/release-tool.mjs', 'verify', '--tag', t], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return { ok: true, line: o.split('\n').filter(l => /result:/.test(l)).join(' ') }; }
   catch (e) { return { ok: false, line: String(e.stdout || '').split('\n').filter(l => /result:/.test(l)).join(' ') }; }
@@ -104,6 +114,7 @@ else if (op === 'batch') {
   for (const [t, v, q, sc, frag] of plan) {
     make(t, v, q, sc);
     out('drafts visible after make: ' + JSON.stringify(ghJson(['api', `repos/${repo}/releases?per_page=100`]).filter(x => x.draft).map(x => [x.tag_name, x.name, x.id])));
+    waitVisible(t);
     const r = verifyLocally(t);
     const pass = frag === 'OK' ? r.ok : (!r.ok && r.line.includes(frag));
     rows.push({ tag: t, scenario: sc, expected: frag === 'OK' ? 'verify OK' : `fail closed [${frag}]`, got: r.line, pass });
