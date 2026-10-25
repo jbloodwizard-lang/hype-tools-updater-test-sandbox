@@ -69,7 +69,31 @@ function verifyLocally(t) {
   try { const o = execFileSync('node', ['.github/scripts/release-tool.mjs', 'verify', '--tag', t], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return { ok: true, line: o.split('\n').filter(l => /result:/.test(l)).join(' ') }; }
   catch (e) { return { ok: false, line: String(e.stdout || '').split('\n').filter(l => /result:/.test(l)).join(' ') }; }
 }
+const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 if (op === 'make') make(tag, version, sequenceArg, scenario);
+else if (op === 'probe-list') {
+  // Diagnostic for the release-lookup anomaly: after creating a draft, list releases repeatedly and record whether
+  // the draft is visible on each read. Draft only (nothing is published); the draft is deleted afterwards.
+  const rows = [];
+  for (const t of tag.split(',')) {
+    make(t, t.slice(1), '3', 'valid');
+    const t0 = Date.now(), pattern = [], ids = [];
+    for (let i = 0; i < 8; i++) {
+      const raw = gh(['api', '-i', `repos/${repo}/releases?per_page=100`]);
+      const cut = raw.search(/\r?\n\r?\n/);
+      const list = JSON.parse(raw.slice(cut).trim());
+      const id = /x-github-request-id:\s*(\S+)/i.exec(raw.slice(0, cut));
+      pattern.push(`${Date.now() - t0}ms:${list.filter(r => r.tag_name === t && r.draft).length}/${list.length}`);
+      ids.push(id && id[1]);
+      sleep(300);
+    }
+    for (const d of findDraftFor(t)) gh(['api', '-X', 'DELETE', `repos/${repo}/releases/${d.id}`]);
+    rows.push({ tag: t, pattern });
+    out(`probe ${t}: visible/total per read => ${pattern.join(' ')}`);
+  }
+  const bad = rows.filter(r => r.pattern.some(p => /:0\//.test(p)));
+  out(`${rows.length} drafts probed, ${bad.length} with at least one read that missed the draft: ${bad.map(r => r.tag).join(',') || 'none'}`);
+}
 else if (op === 'batch') {
   // each entry: tag version sequence scenario expectedFragment
   const plan = JSON.parse(process.env.BATCH);
