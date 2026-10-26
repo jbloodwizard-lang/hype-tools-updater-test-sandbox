@@ -28,7 +28,12 @@
       "version": "4.1.0",
       "sequence": 4,
       "installerSha512": "wnCrtEJEUQQmVhH2+h0U6FUEYiEMDLeY4pMa3mYO1FegMoKP7+G5H/SaN5kk2rIQ+yD7neEt/o9hmIcVV7BBLw==",
-      "status": "pending-verification"
+      "status": "failed-verification",
+      "publishedAt": "2026-10-26T00:31:16Z",
+      "problems": [
+        "test-injected-failure: SANDBOX REHEARSAL ONLY. Injected on purpose at 2026-10-26T00:31:19.570Z, after every real post-publication check passed. No asset was changed."
+      ],
+      "recovery": "restored-and-verified"
     }
   ]
 }
