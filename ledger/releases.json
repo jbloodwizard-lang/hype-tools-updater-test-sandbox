@@ -22,6 +22,13 @@
       "status": "published",
       "publishedAt": "2026-10-25T05:55:12Z",
       "installerSha512": "CTDFkRx3jE3r8+03Jyh2oMOH8qd5xmvufiphLKsJ6nBFg9N7xmbAI3ccGCbu/Zw5UvTPb/dbNtU+vdzmb8oRFA=="
+    },
+    {
+      "tag": "v4.1.0",
+      "version": "4.1.0",
+      "sequence": 4,
+      "installerSha512": "wnCrtEJEUQQmVhH2+h0U6FUEYiEMDLeY4pMa3mYO1FegMoKP7+G5H/SaN5kk2rIQ+yD7neEt/o9hmIcVV7BBLw==",
+      "status": "pending-verification"
     }
   ]
 }
