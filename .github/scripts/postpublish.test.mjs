@@ -30,21 +30,40 @@ function world({ metaSha512, stmtSha512, stmtKey = key, sequence = 5 } = {}) {
 // Fake GitHub: `served` is what the public URL returns (can differ from `release.assets` to simulate corruption).
 function fakeIo(w, o = {}) {
   const served = { ...w.files, ...(o.served || {}) };
-  const st = { latest: o.latest ?? TAG, atom: o.atom ?? TAG, release: o.release || w.release, calls: [], releases: o.releases || {} };
+  const st = { latest: o.latest ?? TAG, atom: o.atom ?? TAG, release: o.release || w.release, calls: [], releases: o.releases || {}, sleeps: [], downloads: {} };
+  // `o.seq` holds answers served once each, in order, before the normal answer: seq.latest / seq.atom entries are a tag or
+  // 'throw'; seq[assetName] entries are an HTTP status or 'throw'; seq.latestAfterSet entries are served after setLatest.
+  const seq = Object.fromEntries(Object.entries(o.seq || {}).map(([k, v]) => [k, [...v]]));
+  const next = k => (seq[k] && seq[k].length ? seq[k].shift() : undefined);
   return {
     st,
     getRelease: async tag => { if (o.getReleaseThrows) throw new Error('boom'); return tag === TAG ? st.release : (st.releases[tag] || (() => { throw new Error('404'); })()); },
-    getLatest: async () => { if (o.getLatestThrows) throw new Error('latest unreadable'); return { tag_name: st.latest }; },
+    getLatest: async () => {
+      if (o.getLatestThrows) throw new Error('latest unreadable');
+      const s = st.calls.some(c => c.startsWith('setLatest')) ? next('latestAfterSet') : next('latest');
+      if (s === 'throw') throw new Error('HTTP 503');
+      return { tag_name: s ?? st.latest };
+    },
+    sleep: async ms => { st.sleeps.push(ms); },
     download: async url => {
       const name = decodeURIComponent(url.split('/').pop());
+      st.downloads[name] = (st.downloads[name] || 0) + 1;
+      const s = next(name);
+      if (s === 'throw') throw new TypeError('fetch failed: ETIMEDOUT');
+      if (typeof s === 'number') return { ok: false, status: s };
       if (o.downloadThrows === name) throw new Error('connection reset');
       if (o.http && o.http[name]) return { ok: false, status: o.http[name] };
       const b = served[name];
       if (!b) return { ok: false, status: 404 };
       return { ok: true, status: 200, size: b.length, sha256: sha(b, 'sha256'), sha512: sha(b, 'sha512'), body: b.length <= 1_000_000 && name !== exp.installer ? b : null };
     },
-    atomFirstTag: async () => st.atom,
-    setLatest: async tag => { st.calls.push(`setLatest ${tag}`); if (o.setLatestThrows) throw new Error('403 forbidden'); if (!o.setLatestNoEffect) st.latest = tag; },
+    atomFirstTag: async () => { const s = next('atom'); if (s === 'throw') throw new Error('atom HTTP 502'); return s ?? st.atom; },
+    setLatest: async tag => {
+      st.calls.push(`setLatest ${tag}`);
+      if (o.setLatestThrows) throw new Error('403 forbidden');
+      if (!o.setLatestNoEffect) st.latest = tag;
+      if (o.setLatestErrorAfter) throw new Error('HTTP 502: Bad Gateway (after the change was applied)');
+    },
   };
 }
 const run = (w, io, extra = {}) => verifyPublication({ io, config, repo: 'o/beta', tag: TAG, version: VER, exp, expected: w.expected, snapshot: w.snapshot, lastSequence: 4, publicKey, ...extra });
@@ -150,6 +169,7 @@ test('restore: previous release becomes latest again and is read back', async ()
   const r = await restorePreviousLatest({ io, config, previous: PREV });
   assert.equal(r.outcome, 'restored-and-verified');
   assert.deepEqual(io.st.calls, ['setLatest v1.5.0']);
+  assert.deepEqual(io.st.sleeps, []);
 });
 
 test('restore fails closed: setting latest fails, no effect, previous unreadable, previous not healthy, no previous', async () => {
@@ -167,9 +187,99 @@ test('restore fails closed: setting latest fails, no effect, previous unreadable
   assert.deepEqual(none.st.calls, []);
 });
 
+test('restore: the read-back decides; a command error with a confirmed state is restored, and the error is kept', async () => {
+  const w = world();
+  const io = fakeIo(w, { releases: { [PREV.tag]: prevRelease() }, setLatestErrorAfter: true });
+  const r = await restorePreviousLatest({ io, config, previous: PREV });
+  assert.equal(r.outcome, 'restored-and-verified');
+  assert.match(r.detail, /command reported an error, but the read-back confirms/);
+  assert.ok(r.steps.some(s => /reported an error: HTTP 502/.test(s)), JSON.stringify(r.steps));
+  // a command error AND a wrong read-back is still restore-failed, never restored
+  const bad = await restorePreviousLatest({ io: fakeIo(w, { releases: { [PREV.tag]: prevRelease() }, setLatestThrows: true }), config, previous: PREV });
+  assert.equal(bad.outcome, 'restore-failed');
+  assert.match(bad.detail, /403 forbidden.*expected v1\.5\.0/);
+});
+
+test('restore: a briefly stale latest read-back is re-read (never re-set); a persistently wrong one stays unverified', async () => {
+  const w = world();
+  const io = fakeIo(w, { releases: { [PREV.tag]: prevRelease() }, seq: { latestAfterSet: [TAG, 'throw'] } });
+  const r = await restorePreviousLatest({ io, config, previous: PREV, delayMs: 10 });
+  assert.equal(r.outcome, 'restored-and-verified');
+  assert.deepEqual(io.st.calls, ['setLatest v1.5.0'], 'the set command is issued exactly once');
+  assert.deepEqual(io.st.sleeps, [10, 20]);
+  const stuck = fakeIo(w, { releases: { [PREV.tag]: prevRelease() }, setLatestNoEffect: true });
+  const s = await restorePreviousLatest({ io: stuck, config, previous: PREV, delayMs: 10 });
+  assert.equal(s.outcome, 'restore-unverified');
+  assert.equal(stuck.st.sleeps.length, 3, 'bounded: 4 reads, 3 waits');
+});
+
+test('public downloads: transient errors are retried and then pass; persistent ones fail after 4 attempts', async () => {
+  const w = world();
+  for (const answers of [[503, 'throw'], [404, 404, 404], [429], [408, 500]]) {
+    const io = fakeIo(w, { seq: { [exp.installer]: answers } });
+    const r = await run(w, io, { delayMs: 1 });
+    assert.deepEqual(r.problems, [], `${answers}: ${JSON.stringify(r.problems)}`);
+    assert.equal(io.st.downloads[exp.installer], answers.length + 1);
+  }
+  const io = fakeIo(w, { seq: { [exp.metadata]: [503, 503, 503, 503, 503] } });
+  const r = await run(w, io, { delayMs: 1 });
+  assert.ok(r.problems.some(p => p === `download-failed: ${exp.metadata}: HTTP 503 (after 4 attempts)`), JSON.stringify(r.problems));
+  assert.equal(io.st.downloads[exp.metadata], 4);
+  const t = fakeIo(w, { seq: { [exp.statement]: ['throw', 'throw', 'throw', 'throw'] } });
+  assert.ok((await run(w, t, { delayMs: 1 })).problems.some(p => p.startsWith('download-failed:') && p.includes('ETIMEDOUT') && p.includes('after 4 attempts')));
+});
+
+test('public downloads: a non-transient status is not retried, and an integrity mismatch is never retried or accepted', async () => {
+  const w = world();
+  const io = fakeIo(w, { seq: { [exp.installer]: [403] } });
+  const r = await run(w, io, { delayMs: 1 });
+  assert.ok(r.problems.some(p => p === `download-failed: ${exp.installer}: HTTP 403`), JSON.stringify(r.problems));
+  assert.equal(io.st.downloads[exp.installer], 1);
+  const bad = Buffer.from(w.installer); bad[5] ^= 1;
+  const m = fakeIo(w, { served: { [exp.installer]: bad } });
+  const mr = await run(w, m, { delayMs: 1 });
+  has(mr, 'digest-mismatch');
+  assert.equal(m.st.downloads[exp.installer], 1, 'a response that arrived is checked once');
+});
+
+test('feed and latest pointer: a stale or failed read is re-read; the last answer counts', async () => {
+  const w = world();
+  const ok = fakeIo(w, { seq: { atom: ['v1.0.0', 'throw', 'v1.0.0'], latest: ['v1.0.0', 'throw'] } });
+  assert.deepEqual((await run(w, ok, { delayMs: 1 })).problems, []);
+  const stale = fakeIo(w, { atom: 'v1.0.0' });
+  const s = await run(w, stale, { delayMs: 1 });
+  assert.ok(s.problems.some(p => p === 'atom-feed: releases.atom first entry is v1.0.0, expected v2.0.0 (after 4 attempts)'), JSON.stringify(s.problems));
+  const broken = fakeIo(w, { seq: { atom: ['throw', 'throw', 'throw', 'throw'] } });
+  has(await run(w, broken, { delayMs: 1 }), 'atom-read');
+  const wrong = fakeIo(w, { latest: 'v1.0.0' });
+  has(await run(w, wrong, { delayMs: 1 }), 'latest-pointer');
+});
+
+test('afterVerify: an extra problem it returns fails the publication through the normal recovery path', async () => {
+  const w = world(), rec = ledgerRecorder();
+  const io = fakeIo(w, { releases: { [PREV.tag]: prevRelease() } });
+  const seen = [];
+  const out = await completePublication({ io, config, repo: 'o/beta', tag: TAG, version: VER, v: draftFacts(w), previous: PREV, latestBefore: PREV.tag, record: rec.record,
+    afterVerify: async result => { seen.push(result.problems.length); return ['test-injected-failure: injected by a test'] } });
+  assert.deepEqual(seen, [0], 'called once, after the real checks, with their result');
+  assert.equal(out.healthy, false);
+  assert.deepEqual(out.problems, ['test-injected-failure: injected by a test']);
+  assert.equal(out.recovery.outcome, 'restored-and-verified');
+  assert.deepEqual(rec.writes, ['pending-verification', 'failed-verification']);
+  assert.equal(rec.last.problems[0], 'test-injected-failure: injected by a test');
+  assert.equal(rec.last.recovery, 'restored-and-verified');
+  const clean = await completePublication({ io: fakeIo(w), config, repo: 'o/beta', tag: TAG, version: VER, v: draftFacts(w), previous: PREV, latestBefore: PREV.tag, record: ledgerRecorder().record, afterVerify: async () => [] });
+  assert.equal(clean.healthy, true);
+  const io2 = fakeIo(w, { releases: { [PREV.tag]: prevRelease() } });
+  const thrown = await completePublication({ io: io2, config, repo: 'o/beta', tag: TAG, version: VER, v: draftFacts(w), previous: PREV, latestBefore: PREV.tag, record: ledgerRecorder().record, afterVerify: async () => { throw new Error('hook broke'); } });
+  assert.equal(thrown.healthy, false);
+  assert.deepEqual(thrown.problems, ['after-verify-error: hook broke']);
+  assert.equal(thrown.recovery.outcome, 'restored-and-verified', 'a broken hook still leads to recovery');
+});
+
 // ---- the whole post-publication path with the ledger ----
 const draftFacts = w => ({ statement: { sequence: 5 }, installerSha512: w.s512, exp, expected: w.expected, snapshot: w.snapshot, lastSequence: 4, publicKey });
-const ledgerRecorder = (failOn) => { const writes = []; return { writes, record: f => { writes.push(f.status); return failOn === f.status ? `write of ${f.status} failed` : null; } }; };
+const ledgerRecorder = (failOn) => { const r = { writes: [], last: null }; r.record = f => { r.writes.push(f.status); r.last = f; return failOn === f.status ? `write of ${f.status} failed` : null; }; return r; };
 const complete = (w, io, rec, previous = PREV) => completePublication({ io, config, repo: 'o/beta', tag: TAG, version: VER, v: draftFacts(w), previous, latestBefore: PREV.tag, record: rec.record });
 
 test('healthy path: ledger goes pending-verification then published, nothing restored', async () => {

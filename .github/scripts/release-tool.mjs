@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   ReleaseError, fail, validateConfig, versionFromTag, checkAssetAllowlist, parseUpdateYml, checkMetadata,
   verifyStatement, validateLedger, lastPublished, planRetention, semverCmp, previousGood, unresolvedPublications, lookupRelease,
@@ -28,7 +29,7 @@ function gh(argv, { input } = {}) {
   return execFileSync('gh', argv, { encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 const ghJson = argv => JSON.parse(gh(argv));
-function listReleases(repo) {
+export function listReleases(repo) {
   const all = [];
   for (let page = 1; page < 20; page++) {
     const part = ghJson(['api', `repos/${repo}/releases?per_page=100&page=${page}`]);
@@ -48,7 +49,7 @@ function downloadAsset(repo, id, dest) {
   });
 }
 
-const realIo = repo => ({
+export const realIo = repo => ({
   getRelease: async tag => ghJson(['api', `repos/${repo}/releases/tags/${tag}`]),
   getLatest: async () => ghJson(['api', `repos/${repo}/releases/latest`]),
   download: publicDownload,
@@ -58,9 +59,10 @@ const realIo = repo => ({
     return atomFirstTag(await res.text());
   },
   setLatest: async tag => { gh(['release', 'edit', tag, '--repo', repo, '--latest']); },
+  sleep: ms => new Promise(r => setTimeout(r, ms)),
 });
 
-function context() {
+export function context() {
   const config = validateConfig(readJson('release-config.json'));
   const repo = process.env.GITHUB_REPOSITORY;
   if (repo !== config.repo) fail('wrong-repository', `this configuration is for ${config.repo}, running in ${repo}`);
@@ -70,7 +72,7 @@ function context() {
   return { config, repo, ledger, tag, version: versionFromTag(config, tag) };
 }
 
-async function verifyDraft(ctx) {
+export async function verifyDraft(ctx) {
   const { config, repo, tag, version, ledger } = ctx;
   const releases = listReleases(repo);
   const rel = lookupRelease(releases, tag, version, () => listReleases(repo));
@@ -140,7 +142,8 @@ function recordLedger(repo, tag, fields) {
   } catch (e) { return `ledger write for ${tag} failed: ${String(e.stderr || e.message).slice(0, 160)}`; }
 }
 
-async function publish(ctx) {
+// `afterVerify` is for the sandbox recovery rehearsal only (see completePublication); the command line never passes it.
+export async function publish(ctx, { afterVerify } = {}) {
   const { config, repo, tag, version } = ctx;
   gateCheck(ctx);
   const v = await verifyDraft(ctx);
@@ -156,7 +159,7 @@ async function publish(ctx) {
   gh(['release', 'edit', tag, '--repo', repo, '--draft=false', '--latest']);
   note(`published ${tag} (previous known-good: ${previous ? previous.tag : 'none'}; latest before: ${latestBefore || 'none'})`);
   // From here the release is public. It is recorded as unverified until every check has passed.
-  const out = await completePublication({ io, config, repo, tag, version, v, previous, latestBefore, record: fields => recordLedger(repo, tag, fields) });
+  const out = await completePublication({ io, config, repo, tag, version, v, previous, latestBefore, record: fields => recordLedger(repo, tag, fields), afterVerify });
   for (const l of out.lines) note(l);
   if (!out.healthy) fail('post-publish-check', `${out.problems.length} problem(s); recovery: ${out.recovery ? out.recovery.outcome : 'not needed'}`);
   note(`ledger updated for ${tag}`);
@@ -177,7 +180,9 @@ async function retention(ctx) {
   }
 }
 
-try {
+export const notes = summary;
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) try {
   const ctx = context();
   if (cmd === 'verify') { await verifyDraft(ctx); }
   else if (cmd === 'gate-check') gateCheck(ctx);

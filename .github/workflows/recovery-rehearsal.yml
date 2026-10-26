@@ -1,0 +1,55 @@
+name: recovery-rehearsal
+
+# SANDBOX ONLY. The single owner-approved real-GitHub recovery rehearsal (hype-tools Issue #30).
+# Publishes one synthetic release, v4.1.0 (sequence 4, disposable key), with the normal release tool. The real
+# post-publication checks run first; only if they all pass is one labelled test-injected failure added (no asset is
+# changed), so the real recovery restores v3.0.0 as latest. The last step checks the final state on GitHub and in the ledger.
+# Guarded twice: the job runs only in this repository with confirm_tag v4.1.0, and rehearsal-recovery.mjs refuses any
+# other repository, configuration or tag. The baseline step fails once v4.1.0 exists, so a second run stops before anything is created.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_tag:
+        description: 'Type v4.1.0 to run the single approved rehearsal'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    if: ${{ github.repository == 'jbloodwizard-lang/hype-tools-updater-test-sandbox' && inputs.confirm_tag == 'v4.1.0' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REHEARSAL_TAG: ${{ inputs.confirm_tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Self-test (offline)
+        run: |
+          node .github/scripts/lib.test.mjs
+          node .github/scripts/postpublish.test.mjs
+          node .github/scripts/publicio.test.mjs
+          node .github/scripts/rehearsal-recovery.test.mjs
+      - name: Baseline (latest is v3.0.0, v4.1.0 unused everywhere)
+        run: node .github/scripts/rehearsal-recovery.mjs baseline
+      - name: Create the synthetic draft v4.1.0 (sequence 4, disposable key)
+        run: node .github/scripts/rehearsal-draft.mjs make v4.1.0 4.1.0 4 valid
+      - name: Normal verification of the draft
+        run: |
+          node .github/scripts/rehearsal-recovery.mjs wait-draft
+          node .github/scripts/release-tool.mjs verify --tag v4.1.0
+      - name: Publish, real checks, injected failure, real recovery (this step is expected to fail)
+        id: publish
+        run: node .github/scripts/rehearsal-recovery.mjs publish --tag v4.1.0
+      - name: Final state on GitHub and in the ledger
+        if: ${{ always() && (steps.publish.outcome == 'success' || steps.publish.outcome == 'failure') }}
+        run: node .github/scripts/rehearsal-recovery.mjs final
